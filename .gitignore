@@ -4,3 +4,7 @@ logs/
 .dolt/
 *.db
 .beads-credential-key
+
+.omc
+.omx
+marketdata.sqlite

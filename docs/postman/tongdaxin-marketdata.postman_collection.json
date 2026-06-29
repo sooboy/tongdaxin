@@ -1,0 +1,478 @@
+{
+  "info": {
+    "name": "Tongdaxin Market Data Service",
+    "description": "通达信行情服务接口测试集合。最快本地启动：`go run ./cmd/marketdata -offline -addr :8083`。离线模式下 `/api/v1/health` 和 `/api/v1/metrics` 可直接成功；行情数据接口在没有本地缓存/存储数据时可能返回 `503 upstream_unavailable` 或 `404 no_data`，这是离线启动的预期结果。连接真实行情源测试时去掉 `-offline`。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8083",
+      "type": "string"
+    },
+    {
+      "key": "market",
+      "value": "SH",
+      "type": "string"
+    },
+    {
+      "key": "code",
+      "value": "600000",
+      "type": "string"
+    },
+    {
+      "key": "symbol_sh",
+      "value": "SH:600000",
+      "type": "string"
+    },
+    {
+      "key": "symbol_sz",
+      "value": "SZ:000001",
+      "type": "string"
+    },
+    {
+      "key": "symbols_csv",
+      "value": "SH:600000,SZ:000001",
+      "type": "string"
+    },
+    {
+      "key": "markets_csv",
+      "value": "SH,SZ",
+      "type": "string"
+    },
+    {
+      "key": "trade_date",
+      "value": "2026-06-25",
+      "type": "string"
+    },
+    {
+      "key": "start_date",
+      "value": "2026-06-01",
+      "type": "string"
+    },
+    {
+      "key": "end_date",
+      "value": "2026-06-25",
+      "type": "string"
+    },
+    {
+      "key": "period",
+      "value": "day",
+      "type": "string"
+    },
+    {
+      "key": "adjust",
+      "value": "qfq",
+      "type": "string"
+    },
+    {
+      "key": "start",
+      "value": "0",
+      "type": "string"
+    },
+    {
+      "key": "count",
+      "value": "10",
+      "type": "string"
+    },
+    {
+      "key": "times",
+      "value": "1",
+      "type": "string"
+    }
+  ],
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('response has JSON content type', function () {",
+          "  pm.expect(pm.response.headers.get('Content-Type') || '').to.include('application/json');",
+          "});",
+          "pm.test('response uses common envelope', function () {",
+          "  const json = pm.response.json();",
+          "  pm.expect(json).to.have.property('ok');",
+          "  if (json.ok === false) {",
+          "    pm.expect(json).to.have.property('error');",
+          "    pm.expect(json.error).to.have.property('code');",
+          "    pm.expect(json.error).to.have.property('message');",
+          "  }",
+          "});"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Startup / Smoke",
+      "description": "离线模式也应该通过的基础检查。",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/health",
+            "description": "服务健康检查。离线启动也应返回 200。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('health returns 200 ok', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.ok).to.eql(true);",
+                  "  pm.expect(json.data.status).to.eql('ok');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Metrics Snapshot",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/metrics",
+            "description": "路由请求数、错误数和状态分桶快照。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('metrics returns 200 ok', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.ok).to.eql(true);",
+                  "  pm.expect(json.data).to.have.property('requests_total');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1. Quotes / OrderBook",
+      "description": "实时快照和五档盘口。GET 支持 query；POST 支持 JSON body。离线模式无缓存时通常返回 upstream_unavailable。",
+      "item": [
+        {
+          "name": "GET Quotes - Batch Symbols",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/quotes?symbols=SH:600000,SZ:000001",
+            "description": "批量行情快照：symbols 使用 `SH:600000,SZ:000001` 格式。"
+          }
+        },
+        {
+          "name": "GET Quotes - Single Symbol",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/quotes?market=SH&code=600000",
+            "description": "单股票行情快照。"
+          }
+        },
+        {
+          "name": "POST Quotes - Batch Symbols",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"symbols\": [\n    \"SH:600000\",\n    \"SZ:000001\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "http://127.0.0.1:8083/api/v1/quotes",
+            "description": "POST 批量行情快照。"
+          }
+        },
+        {
+          "name": "GET OrderBook - Single Symbol",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/orderbook?market=SH&code=600000",
+            "description": "五档盘口。"
+          }
+        },
+        {
+          "name": "POST OrderBook - Single Symbol",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"market\": \"SH\",\n  \"code\": \"600000\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "http://127.0.0.1:8083/api/v1/orderbook",
+            "description": "POST 五档盘口。"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Tick / History / KLine",
+      "description": "当日分笔、历史分笔、K线和复权 K线。历史/K线接口优先本地存储/缓存，离线无数据时可能返回 no_data。",
+      "item": [
+        {
+          "name": "GET Today Ticks",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/ticks?market=SH&code=600000&start=0&count=10&full=false&force_refresh=false",
+            "description": "当日分笔成交。full=true 时请求全量。"
+          }
+        },
+        {
+          "name": "GET History Ticks",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/history-ticks?market=SH&code=600000&date=2026-06-25&start=0&count=10&full=false&with_transaction_flag=false&force_refresh=false",
+            "description": "历史分笔成交。date 可选，省略时默认查询当天；传入时格式 YYYY-MM-DD。"
+          }
+        },
+        {
+          "name": "GET KLine - Raw",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/kline?market=SH&code=600000&period=day&adjust=none&start=0&count=10&times=1&start_date=2026-06-01&end_date=2026-06-25&force_refresh=false",
+            "description": "原始 K线。period 可用：1m, 5m, 15m, 30m, 1h, day, week, month, quarter, year。"
+          }
+        },
+        {
+          "name": "GET KLine - Adjusted via /kline",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/kline?market=SH&code=600000&period=day&adjust=qfq&start=0&count=10&times=1&start_date=2026-06-01&end_date=2026-06-25&force_refresh=false",
+            "description": "通过 /kline 查询复权 K线；adjust 可用 none/qfq/hfq。"
+          }
+        },
+        {
+          "name": "GET Adjusted KLine Route",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/adjusted-kline?market=SH&code=600000&period=day&adjust=qfq&start=0&count=10&times=1&start_date=2026-06-01&end_date=2026-06-25&force_refresh=false",
+            "description": "复权 K线专用别名路由。"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Static / Finance",
+      "description": "除权除息、证券列表、财务/F10 类低频资料。",
+      "item": [
+        {
+          "name": "GET Trading Day",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/trading-day",
+            "description": "交易日状态。基于 gotdx MACServerInfo 判断今天是否交易日、最近交易日、上一个交易日，并按低频资料缓存。"
+          }
+        },
+        {
+          "name": "GET XDXR Events",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/xdxr?market=SH&code=600000",
+            "description": "除权除息事件。"
+          }
+        },
+        {
+          "name": "GET Securities - Markets",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/securities?markets=SH,SZ&start=0&count=100&refresh=false",
+            "description": "证券基础列表。markets 支持逗号分隔。"
+          }
+        },
+        {
+          "name": "GET Securities - Single Market",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/securities?market=SH&start=0&count=100&refresh=false",
+            "description": "单市场证券基础列表。"
+          }
+        },
+        {
+          "name": "GET Securities - Single Symbol",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/securities?symbol=SH:600000&refresh=false",
+            "description": "单只证券基础信息。服务端按市场全量低频缓存后本地过滤。"
+          }
+        },
+        {
+          "name": "GET Finance",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/finance?market=SH&code=600000",
+            "description": "财务/F10 低频资料。"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Error / Limit Smoke",
+      "description": "错误响应格式验证。",
+      "item": [
+        {
+          "name": "Invalid Request Example",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": "http://127.0.0.1:8083/api/v1/history-ticks?symbol=bad&date=bad",
+            "description": "故意传入非法 symbol/date，应返回 400 invalid_request。"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('invalid request returns 400', function () {",
+                  "  pm.response.to.have.status(400);",
+                  "  const json = pm.response.json();",
+                  "  pm.expect(json.ok).to.eql(false);",
+                  "  pm.expect(json.error.code).to.eql('invalid_request');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
