@@ -30,6 +30,8 @@ func TestBuildConfigParsesStorageFlags(t *testing.T) {
 	cfg, err := buildConfig([]string{
 		"-offline",
 		"-addr", "127.0.0.1:0",
+		"-http-router", "gin",
+		"-grpc-addr", "127.0.0.1:9090",
 		"-max-hosts-per-pool", "3",
 		"-clients-per-host", "2",
 		"-storage-dialect", "sqlite",
@@ -40,7 +42,7 @@ func TestBuildConfigParsesStorageFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildConfig: %v", err)
 	}
-	if !cfg.DisableLive || cfg.Addr != "127.0.0.1:0" || cfg.MaxHostsPerPool != 3 || cfg.ClientsPerHost != 2 {
+	if !cfg.DisableLive || cfg.Addr != "127.0.0.1:0" || cfg.HTTPRouter != "gin" || cfg.GRPCAddr != "127.0.0.1:9090" || cfg.MaxHostsPerPool != 3 || cfg.ClientsPerHost != 2 {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 	if cfg.StorageDialect != storage.DialectSQLite || cfg.StorageDSN != "file:test.sqlite" || cfg.StorageMaxOpenConns != 4 || cfg.StorageMaxIdleConns != 2 {
@@ -52,11 +54,12 @@ func TestBuildConfigParsesCacheFlags(t *testing.T) {
 
 	cfg, err := buildConfig([]string{
 		"-cache-redis-url", "redis://127.0.0.1:6379/1",
+		"-cache-key-prefix", "marketdata:test",
 	})
 	if err != nil {
 		t.Fatalf("buildConfig: %v", err)
 	}
-	if cfg.CacheRedisURL != "redis://127.0.0.1:6379/1" {
+	if cfg.CacheRedisURL != "redis://127.0.0.1:6379/1" || cfg.CacheKeyPrefix != "marketdata:test" {
 		t.Fatalf("cache cfg = %+v", cfg)
 	}
 }

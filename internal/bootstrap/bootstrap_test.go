@@ -83,6 +83,31 @@ func TestBuildOfflineDoesNotCreateProvider(t *testing.T) {
 	}
 }
 
+func TestBuildSupportsGinRouter(t *testing.T) {
+	t.Parallel()
+
+	app, err := Build(context.Background(), Config{Addr: "127.0.0.1:0", DisableLive: true, HTTPRouter: "gin"})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	body, status := requestJSON(t, app.Handler, "/api/v1/health")
+	if status != http.StatusOK || body["ok"] != true {
+		t.Fatalf("status=%d body=%#v", status, body)
+	}
+}
+
+func TestBuildEnablesGRPCServer(t *testing.T) {
+	t.Parallel()
+
+	app, err := Build(context.Background(), Config{Addr: "127.0.0.1:0", GRPCAddr: "127.0.0.1:0", DisableLive: true})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if app.GRPCServer == nil || app.GRPCAddr != "127.0.0.1:0" {
+		t.Fatalf("grpc app = %+v", app)
+	}
+}
+
 func TestBuildUsesSQLStorage(t *testing.T) {
 	t.Parallel()
 

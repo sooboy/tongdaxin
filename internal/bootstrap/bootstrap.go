@@ -6,9 +6,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	ginapi "github.com/sooboy/tongdaxin/internal/api/gin"
+	grpcapi "github.com/sooboy/tongdaxin/internal/api/grpc"
 	httpapi "github.com/sooboy/tongdaxin/internal/api/http"
 	"github.com/sooboy/tongdaxin/internal/cache"
 	"github.com/sooboy/tongdaxin/internal/domain"
@@ -16,11 +19,14 @@ import (
 	gotdxadapter "github.com/sooboy/tongdaxin/internal/provider/gotdx"
 	"github.com/sooboy/tongdaxin/internal/service"
 	"github.com/sooboy/tongdaxin/internal/storage"
+	grpcgo "google.golang.org/grpc"
 )
 
 // Config wires the runnable market-data server without exposing vendor types.
 type Config struct {
 	Addr            string
+	GRPCAddr        string
+	HTTPRouter      string
 	DisableLive     bool
 	QuoteHosts      []string
 	TickHosts       []string
@@ -39,6 +45,7 @@ type Config struct {
 	StorageMaxIdleConns int
 
 	CacheRedisURL  string
+	CacheKeyPrefix string
 	RateLimitRPS   int
 	RateLimitBurst int
 	LogDir         string
@@ -54,6 +61,8 @@ type ProviderFactory func(context.Context, Config) (domain.MarketDataProvider, f
 // App owns the HTTP server and optional upstream close hook.
 type App struct {
 	Server          *http.Server
+	GRPCServer      *grpcgo.Server
+	GRPCAddr        string
 	Handler         http.Handler
 	Store           domain.HistoryStore
 	Cache           cache.Cache
@@ -79,7 +88,10 @@ func Build(ctx context.Context, cfg Config) (*App, error) {
 	if cfg.ProviderFactory == nil {
 		cfg.ProviderFactory = buildLiveProvider
 	}
-	log.Printf("bootstrap build start addr=%s offline=%t storage=%s redis_cache=%t rate_limit_rps=%d", cfg.Addr, cfg.DisableLive, cfg.StorageDialect, cfg.CacheRedisURL != "", cfg.RateLimitRPS)
+	if cfg.HTTPRouter == "" {
+		cfg.HTTPRouter = "nethttp"
+	}
+	log.Printf("bootstrap build start addr=%s grpc_addr=%s http_router=%s offline=%t storage=%s redis_cache=%t cache_prefix=%q rate_limit_rps=%d", cfg.Addr, cfg.GRPCAddr, cfg.HTTPRouter, cfg.DisableLive, cfg.StorageDialect, cfg.CacheRedisURL != "", cfg.CacheKeyPrefix, cfg.RateLimitRPS)
 
 	store, queue, storeClose, err := buildStore(ctx, cfg)
 	if err != nil {
@@ -138,15 +150,26 @@ func Build(ctx context.Context, cfg Config) (*App, error) {
 	}
 
 	svc := service.NewMarketDataService(provider, store, queue, cacheStore)
-	handler := httpapi.NewWithOptions(svc, httpapi.Options{
+	handlerOpts := httpapi.Options{
 		RateLimiter: httpapi.NewRateLimiter(httpapi.RateLimitConfig{RequestsPerSecond: cfg.RateLimitRPS, Burst: cfg.RateLimitBurst}),
 		Logger:      log.Default(),
-	})
+	}
+	handler, err := buildHTTPHandler(svc, cfg, handlerOpts)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	var grpcServer *grpcgo.Server
+	if strings.TrimSpace(cfg.GRPCAddr) != "" {
+		grpcServer = grpcapi.NewGRPCServer(svc)
+	}
 	return &App{
 		Server: &http.Server{
 			Addr:    cfg.Addr,
 			Handler: handler,
 		},
+		GRPCServer:      grpcServer,
+		GRPCAddr:        strings.TrimSpace(cfg.GRPCAddr),
 		Handler:         handler,
 		Store:           store,
 		Cache:           cacheStore,
@@ -154,6 +177,17 @@ func Build(ctx context.Context, cfg Config) (*App, error) {
 		shutdownStartFn: shutdownStartFn,
 		closeFn:         closeFn,
 	}, nil
+}
+
+func buildHTTPHandler(svc httpapi.MarketDataService, cfg Config, opts httpapi.Options) (http.Handler, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.HTTPRouter)) {
+	case "", "nethttp", "stdlib", "http":
+		return httpapi.NewWithOptions(svc, opts), nil
+	case "gin":
+		return ginapi.NewWithOptions(svc, opts), nil
+	default:
+		return nil, domain.ErrInvalidRequest
+	}
 }
 
 func runProviderFactoryUntilReady(ctx context.Context, runtime *providerRuntime, cfg Config) {
@@ -196,7 +230,9 @@ func buildCache(ctx context.Context, cfg Config) (cache.Cache, error) {
 	if cfg.CacheRedisURL == "" {
 		return cache.NewMemory(cache.DefaultConfig()), nil
 	}
-	return cache.OpenRedis(ctx, cfg.CacheRedisURL, cache.DefaultConfig())
+	cacheCfg := cache.DefaultConfig()
+	cacheCfg.KeyPrefix = cfg.CacheKeyPrefix
+	return cache.OpenRedis(ctx, cfg.CacheRedisURL, cacheCfg)
 }
 
 func buildStore(ctx context.Context, cfg Config) (domain.HistoryStore, domain.BackfillQueue, func(context.Context) error, error) {
@@ -263,13 +299,58 @@ func (a *App) ListenAndServe(ctx context.Context) error {
 	if a == nil || a.Server == nil {
 		return domain.ErrInvalidRequest
 	}
-	ln, err := net.Listen("tcp", a.Server.Addr)
+	httpLn, err := net.Listen("tcp", a.Server.Addr)
 	if err != nil {
 		return errors.Join(err, a.Shutdown(context.Background()))
 	}
-	log.Printf("market-data service listening on %s", ln.Addr().String())
-	defer ln.Close()
-	return a.Serve(ctx, ln)
+	log.Printf("market-data HTTP service listening on %s", httpLn.Addr().String())
+	defer httpLn.Close()
+
+	var grpcLn net.Listener
+	if a.GRPCServer != nil && strings.TrimSpace(a.GRPCAddr) != "" {
+		grpcLn, err = net.Listen("tcp", a.GRPCAddr)
+		if err != nil {
+			return errors.Join(err, a.Shutdown(context.Background()))
+		}
+		log.Printf("market-data gRPC service listening on %s", grpcLn.Addr().String())
+		defer grpcLn.Close()
+	}
+	return a.serveListeners(ctx, httpLn, grpcLn)
+}
+
+func (a *App) serveListeners(ctx context.Context, httpLn net.Listener, grpcLn net.Listener) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	errCh := make(chan error, 2)
+	go func() { errCh <- a.Server.Serve(httpLn) }()
+	if grpcLn != nil && a.GRPCServer != nil {
+		go func() { errCh <- a.GRPCServer.Serve(grpcLn) }()
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, grpcgo.ErrServerStopped) {
+			return errors.Join(err, a.Shutdown(context.Background()))
+		}
+		return nil
+	case <-ctx.Done():
+		return a.Shutdown(context.Background())
+	}
+}
+
+func stopGRPCServer(server *grpcgo.Server, ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		server.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		server.Stop()
+		<-done
+	}
 }
 
 // Shutdown closes the HTTP server and the upstream provider, if any.
@@ -295,6 +376,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 		var errs []error
 		if err := a.Server.Shutdown(serverCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs = append(errs, err)
+		}
+		if a.GRPCServer != nil {
+			stopGRPCServer(a.GRPCServer, serverCtx)
 		}
 		if a.closeFn != nil {
 			cleanupCtx := context.Background()

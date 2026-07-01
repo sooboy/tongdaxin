@@ -73,6 +73,66 @@ func TestSQLStoreTicksBarsAndCoverage(t *testing.T) {
 	}
 }
 
+func TestSQLStorePutOperationsAreIdempotent(t *testing.T) {
+	t.Parallel()
+
+	store := openSQLiteStore(t)
+	symbol := mustSymbol(t)
+	date := time.Date(2026, 6, 25, 0, 0, 0, 0, time.Local)
+	tickTime := date.Add(10 * time.Hour)
+	if err := store.PutTicks(context.Background(), []domain.Tick{{Symbol: symbol, TradeDate: date, TradeTime: tickTime, Sequence: 1, Price: 10}}); err != nil {
+		t.Fatalf("PutTicks first: %v", err)
+	}
+	if err := store.PutTicks(context.Background(), []domain.Tick{{Symbol: symbol, TradeDate: date, TradeTime: tickTime, Sequence: 1, Price: 11}}); err != nil {
+		t.Fatalf("PutTicks second: %v", err)
+	}
+	ticks, err := store.QueryTicks(context.Background(), domain.HistoryTickQuery{Symbol: symbol, TradeDate: date})
+	if err != nil {
+		t.Fatalf("QueryTicks: %v", err)
+	}
+	if len(ticks) != 1 || ticks[0].Price != 11 {
+		t.Fatalf("ticks = %+v", ticks)
+	}
+
+	barTime := date.AddDate(0, 0, -1)
+	if err := store.PutBars(context.Background(), []domain.Bar{{Symbol: symbol, Period: domain.PeriodDay, AdjustType: domain.AdjustNone, Time: barTime, Close: 1}}); err != nil {
+		t.Fatalf("PutBars first: %v", err)
+	}
+	if err := store.PutBars(context.Background(), []domain.Bar{{Symbol: symbol, Period: domain.PeriodDay, AdjustType: domain.AdjustNone, Time: barTime, Close: 2}}); err != nil {
+		t.Fatalf("PutBars second: %v", err)
+	}
+	bars, err := store.QueryBars(context.Background(), domain.BarQuery{Symbol: symbol, Period: domain.PeriodDay, AdjustType: domain.AdjustNone})
+	if err != nil {
+		t.Fatalf("QueryBars: %v", err)
+	}
+	if len(bars) != 1 || bars[0].Close != 2 {
+		t.Fatalf("bars = %+v", bars)
+	}
+}
+
+func TestSQLStoreCoverageDoesNotDowngradeCovered(t *testing.T) {
+	t.Parallel()
+
+	store := openSQLiteStore(t)
+	symbol := mustSymbol(t)
+	date := time.Date(2026, 6, 25, 0, 0, 0, 0, time.Local)
+	covered := domain.HistoryCoverage{Dataset: domain.DatasetHistoryTick, Symbol: symbol, TradeDate: date, Status: domain.CoverageCovered, RowCount: 100, Checksum: "full"}
+	if err := store.PutCoverage(context.Background(), covered); err != nil {
+		t.Fatalf("PutCoverage covered: %v", err)
+	}
+	missing := domain.HistoryCoverage{Dataset: domain.DatasetHistoryTick, Symbol: symbol, TradeDate: date, Status: domain.CoverageMissing, RowCount: 0, LastError: "temporary"}
+	if err := store.PutCoverage(context.Background(), missing); err != nil {
+		t.Fatalf("PutCoverage missing: %v", err)
+	}
+	got, err := store.Coverage(context.Background(), domain.CoverageRequest{Dataset: domain.DatasetHistoryTick, Symbol: symbol, TradeDate: date})
+	if err != nil {
+		t.Fatalf("Coverage: %v", err)
+	}
+	if got.Status != domain.CoverageCovered || got.RowCount != 100 || got.Checksum != "full" {
+		t.Fatalf("coverage downgraded = %+v", got)
+	}
+}
+
 func TestSQLStoreBackfillQueueLifecycle(t *testing.T) {
 	t.Parallel()
 

@@ -84,6 +84,49 @@ func TestRedisFinanceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRedisKeyPrefixAndLock(t *testing.T) {
+	t.Parallel()
+
+	srv, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	t.Cleanup(srv.Close)
+
+	client := redis.NewClient(&redis.Options{Addr: srv.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	cacheA := NewRedis(client, Config{KeyPrefix: "app:a", QuoteTTL: time.Minute})
+	cacheB := NewRedis(client, Config{KeyPrefix: "app:b", QuoteTTL: time.Minute})
+	symbol := mustRedisSymbol(t)
+	if err := cacheA.PutQuotes(context.Background(), []domain.Quote{{Symbol: symbol, LastPrice: 12.5}}); err != nil {
+		t.Fatalf("PutQuotes: %v", err)
+	}
+	hits, misses, err := cacheB.GetQuotes(context.Background(), []domain.Symbol{symbol})
+	if err != nil {
+		t.Fatalf("GetQuotes B: %v", err)
+	}
+	if len(hits) != 0 || len(misses) != 1 {
+		t.Fatalf("prefix isolation hits=%+v misses=%+v", hits, misses)
+	}
+
+	token, ok, err := cacheA.TryLock(context.Background(), "quotes:"+symbol.Key(), time.Minute)
+	if err != nil || !ok || token == "" {
+		t.Fatalf("TryLock first token=%q ok=%v err=%v", token, ok, err)
+	}
+	_, ok, err = cacheA.TryLock(context.Background(), "quotes:"+symbol.Key(), time.Minute)
+	if err != nil || ok {
+		t.Fatalf("TryLock second ok=%v err=%v", ok, err)
+	}
+	if err := cacheA.Unlock(context.Background(), "quotes:"+symbol.Key(), token); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	_, ok, err = cacheA.TryLock(context.Background(), "quotes:"+symbol.Key(), time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("TryLock after unlock ok=%v err=%v", ok, err)
+	}
+}
+
 func mustRedisSymbol(t *testing.T) domain.Symbol {
 	t.Helper()
 	symbol, err := domain.NewSymbol(domain.MarketSH, "600000")

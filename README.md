@@ -39,6 +39,98 @@ max-hosts-per-pool: 4~6
 clients-per-host: 2~3
 ```
 
+
+## HTTP 路由版本
+
+默认使用标准库 `net/http` 路由：
+
+```bash
+go run ./cmd/marketdata --addr ":8083" --http-router nethttp
+```
+
+也可以切换到 Gin 路由版本，接口路径和返回 JSON 结构保持一致：
+
+```bash
+go run ./cmd/marketdata --addr ":8083" --http-router gin
+```
+
+环境变量等价写法：
+
+```bash
+MARKETDATA_HTTP_ROUTER=gin go run ./cmd/marketdata --addr ":8083"
+```
+
+
+第三方项目如果要嵌入 Gin 路由，可以实现 `pkg/marketdata.Service`，然后把本项目路由注册到自己的 Gin Engine 或 Group 上：
+
+```go
+import (
+    "github.com/gin-gonic/gin"
+    md "github.com/sooboy/tongdaxin/pkg/marketdata"
+    mdgin "github.com/sooboy/tongdaxin/pkg/marketdata/gin"
+)
+
+var svc md.Service = myService{}
+router := gin.New()
+mdgin.RegisterRoutes(router, svc)
+
+// 或者挂到调用方自己的分组上：
+// group := router.Group("")
+// mdgin.RegisterRoutes(group, svc)
+```
+
+## gRPC 调用版本
+
+HTTP 和 gRPC 可以同时启动：
+
+```bash
+go run ./cmd/marketdata --addr ":8083" --grpc-addr ":9090"
+```
+
+可供第三方 import 的 gRPC 包位于 `pkg/marketdata/grpc`，服务名为：
+
+```text
+tongdaxin.marketdata.v1.MarketData
+```
+
+当前 gRPC 层使用 JSON codec 的 unary 调用，不依赖本机安装 `protoc`。Go 第三方项目调用示例：
+
+```go
+import (
+    mdgrpc "github.com/sooboy/tongdaxin/pkg/marketdata/grpc"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+)
+
+conn, err := mdgrpc.DialContext(ctx, "127.0.0.1:9090",
+    grpc.WithTransportCredentials(insecure.NewCredentials()),
+)
+if err != nil {
+    return err
+}
+defer conn.Close()
+
+client := mdgrpc.NewClient(conn)
+resp, err := client.GetQuotes(ctx, &mdgrpc.SymbolsRequest{
+    Symbols: []mdgrpc.Symbol{{Market: "SH", Code: "600000"}},
+})
+```
+
+已提供的 gRPC 方法：
+
+```text
+Health
+GetQuotes
+GetOrderBook
+GetTicks
+GetHistoryTicks
+GetKLine
+GetXDXR
+GetSecurities
+GetFinance
+GetTradingDay
+```
+
 ## 缓存与持久化
 
 默认启动方式：
@@ -70,6 +162,20 @@ go run ./cmd/marketdata --addr ":8083"
 
 Redis 用于接口缓存，不等同于历史数据持久化。
 
+多实例或多环境共用 Redis 时，建议显式配置 key prefix，避免测试/生产或多个应用之间 key 冲突：
+
+```bash
+go run ./cmd/marketdata --addr ":8083" \
+  --cache-redis-url "redis://127.0.0.1:6379/1" \
+  --cache-key-prefix "marketdata:prod"
+```
+
+或：
+
+```bash
+MARKETDATA_CACHE_KEY_PREFIX="marketdata:prod" go run ./cmd/marketdata --addr ":8083"
+```
+
 ### SQLite 持久化
 
 ```bash
@@ -89,6 +195,22 @@ file:marketdata.sqlite?_pragma=foreign_keys(1)&_time_format=sqlite
 ```text
 sqlite, postgres, mysql
 ```
+
+
+### 多实例共享 Redis / PostgreSQL
+
+当前已经对多实例场景做了基础加固：
+
+- Redis 支持自定义 key prefix。
+- SQL 历史 ticks / K 线 / securities / coverage 写入使用幂等 upsert。
+- PostgreSQL backfill 任务领取使用原子 claim，避免多个实例同时抢同一个任务。
+- coverage 更新避免已完整覆盖的数据被 missing/partial 状态降级。
+
+默认内存缓存 + 内存 store 不受这些改动影响。
+
+详细的数据流、查询顺序、入库规则和多实例并发行为见：
+
+- [多实例 Redis / PostgreSQL 数据流说明](docs/MULTI_INSTANCE_REDIS_POSTGRES.md)
 
 ## 常用接口
 

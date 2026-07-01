@@ -184,16 +184,7 @@ func (s *SQLStore) PutCoverage(ctx context.Context, coverage domain.HistoryCover
 		coverage.LastFetchTime = now
 	}
 	return withTx(ctx, s.db, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, bind(s.dialect, `DELETE FROM history_coverage WHERE dataset = ? AND market = ? AND code = ? AND trade_date = ? AND period = ? AND adjust_type = ?`),
-			coverage.Dataset, coverage.Symbol.Market, coverage.Symbol.Code, coverage.TradeDate, coverage.Period, coverage.AdjustType); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx, bind(s.dialect, `
-INSERT INTO history_coverage (
-	dataset, market, code, trade_date, period, adjust_type, status, row_count, checksum, source_address, last_fetch_time, last_error, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-			coverage.Dataset, coverage.Symbol.Market, coverage.Symbol.Code, coverage.TradeDate, coverage.Period, coverage.AdjustType, coverage.Status, coverage.RowCount, coverage.Checksum, coverage.SourceAddress, nullableTime(coverage.LastFetchTime), coverage.LastError, now)
-		return err
+		return s.upsertCoverage(ctx, tx, coverage, now)
 	})
 }
 
@@ -215,14 +206,7 @@ func (s *SQLStore) PutSecurities(ctx context.Context, items []domain.SecurityInf
 			if err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(ctx, bind(s.dialect, `DELETE FROM securities WHERE market = ? AND code = ?`), item.Symbol.Market, item.Symbol.Code); err != nil {
-				return err
-			}
-			_, err = tx.ExecContext(ctx, bind(s.dialect, `
-INSERT INTO securities (market, code, name, type, status, fields, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`),
-				item.Symbol.Market, item.Symbol.Code, item.Symbol.Name, item.Symbol.Type, item.Symbol.Status, string(fields), now)
-			if err != nil {
+			if err := s.upsertSecurity(ctx, tx, item, string(fields), now); err != nil {
 				return err
 			}
 		}
@@ -331,15 +315,7 @@ func (s *SQLStore) PutTicks(ctx context.Context, ticks []domain.Tick) error {
 			if tradeDate.IsZero() {
 				return domain.ErrInvalidRequest
 			}
-			if _, err := tx.ExecContext(ctx, bind(s.dialect, `DELETE FROM history_ticks WHERE market = ? AND code = ? AND trade_date = ? AND trade_time = ? AND sequence = ?`),
-				tick.Symbol.Market, tick.Symbol.Code, tradeDate, tick.TradeTime, tick.Sequence); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, bind(s.dialect, `
-INSERT INTO history_ticks (
-	market, code, trade_date, trade_time, price, volume, amount, direction, sequence, source, source_address, fetch_time, checksum
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-				tick.Symbol.Market, tick.Symbol.Code, tradeDate, tick.TradeTime, tick.Price, tick.Volume, tick.Amount, tick.Direction, tick.Sequence, tick.Source, "", nil, ""); err != nil {
+			if err := s.upsertTick(ctx, tx, tick, tradeDate); err != nil {
 				return err
 			}
 		}
@@ -413,15 +389,7 @@ func (s *SQLStore) PutBars(ctx context.Context, bars []domain.Bar) error {
 			if adjust == "" {
 				adjust = domain.AdjustNone
 			}
-			if _, err := tx.ExecContext(ctx, bind(s.dialect, `DELETE FROM kline_bars WHERE market = ? AND code = ? AND period = ? AND adjust_type = ? AND bar_time = ?`),
-				bar.Symbol.Market, bar.Symbol.Code, bar.Period, adjust, bar.Time); err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, bind(s.dialect, `
-INSERT INTO kline_bars (
-	market, code, period, adjust_type, bar_time, open, high, low, close, volume, amount, source, source_address, fetch_time, checksum
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-				bar.Symbol.Market, bar.Symbol.Code, bar.Period, adjust, bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Amount, bar.Source, "", nil, ""); err != nil {
+			if err := s.upsertBar(ctx, tx, bar, adjust); err != nil {
 				return err
 			}
 		}
@@ -536,6 +504,9 @@ func (s *SQLStore) Next(ctx context.Context) (domain.BackfillTask, bool, error) 
 	if err := ctxErr(ctx); err != nil {
 		return domain.BackfillTask{}, false, err
 	}
+	if s.dialect == DialectPostgres {
+		return s.nextPostgres(ctx)
+	}
 	row := s.db.QueryRowContext(ctx, bind(s.dialect, `
 SELECT task_id, dataset, market, code, start_date, end_date, period, adjust_type, priority, status, retry_count, next_retry_time, error_message, created_at, updated_at
 FROM backfill_tasks
@@ -551,6 +522,30 @@ ORDER BY priority DESC, created_at ASC, task_id ASC`), domain.BackfillPending, d
 	task.Status = domain.BackfillRunning
 	task.UpdatedAt = time.Now()
 	if err := s.Update(ctx, task); err != nil {
+		return domain.BackfillTask{}, false, err
+	}
+	return task, true, nil
+}
+
+func (s *SQLStore) nextPostgres(ctx context.Context) (domain.BackfillTask, bool, error) {
+	row := s.db.QueryRowContext(ctx, bind(s.dialect, `
+UPDATE backfill_tasks
+SET status = ?, updated_at = ?
+WHERE task_id = (
+	SELECT task_id
+	FROM backfill_tasks
+	WHERE status = ? OR status = ?
+	ORDER BY priority DESC, created_at ASC, task_id ASC
+	FOR UPDATE SKIP LOCKED
+	LIMIT 1
+)
+RETURNING task_id, dataset, market, code, start_date, end_date, period, adjust_type, priority, status, retry_count, next_retry_time, error_message, created_at, updated_at`),
+		domain.BackfillRunning, time.Now(), domain.BackfillPending, domain.BackfillRetrying)
+	var task domain.BackfillTask
+	if err := scanTask(row, &task); err != nil {
+		if errorsIsNoRows(err) {
+			return domain.BackfillTask{}, false, nil
+		}
 		return domain.BackfillTask{}, false, err
 	}
 	return task, true, nil
@@ -629,6 +624,209 @@ FROM backfill_tasks`
 		return nil, err
 	}
 	return out, nil
+}
+
+func (s *SQLStore) upsertSecurity(ctx context.Context, tx *sql.Tx, item domain.SecurityInfo, fields string, now time.Time) error {
+	baseArgs := []any{item.Symbol.Market, item.Symbol.Code, item.Symbol.Name, item.Symbol.Type, item.Symbol.Status, fields, now}
+	switch s.dialect {
+	case DialectPostgres:
+		_, err := tx.ExecContext(ctx, bind(s.dialect, `
+INSERT INTO securities (market, code, name, type, status, fields, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (market, code) DO UPDATE SET
+	name = EXCLUDED.name,
+	type = EXCLUDED.type,
+	status = EXCLUDED.status,
+	fields = EXCLUDED.fields,
+	updated_at = EXCLUDED.updated_at`), baseArgs...)
+		return err
+	case DialectMySQL:
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO securities (market, code, name, type, status, fields, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+	name = VALUES(name),
+	type = VALUES(type),
+	status = VALUES(status),
+	fields = VALUES(fields),
+	updated_at = VALUES(updated_at)`, baseArgs...)
+		return err
+	default:
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO securities (market, code, name, type, status, fields, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (market, code) DO UPDATE SET
+	name = excluded.name,
+	type = excluded.type,
+	status = excluded.status,
+	fields = excluded.fields,
+	updated_at = excluded.updated_at`, baseArgs...)
+		return err
+	}
+}
+
+func (s *SQLStore) upsertCoverage(ctx context.Context, tx *sql.Tx, coverage domain.HistoryCoverage, now time.Time) error {
+	args := []any{coverage.Dataset, coverage.Symbol.Market, coverage.Symbol.Code, coverage.TradeDate, coverage.Period, coverage.AdjustType, coverage.Status, coverage.RowCount, coverage.Checksum, coverage.SourceAddress, nullableTime(coverage.LastFetchTime), coverage.LastError, now}
+	switch s.dialect {
+	case DialectPostgres:
+		_, err := tx.ExecContext(ctx, bind(s.dialect, `
+INSERT INTO history_coverage (
+	dataset, market, code, trade_date, period, adjust_type, status, row_count, checksum, source_address, last_fetch_time, last_error, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (dataset, market, code, trade_date, period, adjust_type) DO UPDATE SET
+	status = CASE
+		WHEN history_coverage.status = 'covered' AND EXCLUDED.status <> 'covered' THEN history_coverage.status
+		ELSE EXCLUDED.status
+	END,
+	row_count = GREATEST(history_coverage.row_count, EXCLUDED.row_count),
+	checksum = CASE
+		WHEN history_coverage.status = 'covered' AND EXCLUDED.status <> 'covered' THEN history_coverage.checksum
+		WHEN length(EXCLUDED.checksum) = 0 THEN history_coverage.checksum
+		ELSE EXCLUDED.checksum
+	END,
+	source_address = CASE WHEN length(EXCLUDED.source_address) = 0 THEN history_coverage.source_address ELSE EXCLUDED.source_address END,
+	last_fetch_time = CASE
+		WHEN history_coverage.last_fetch_time IS NULL THEN EXCLUDED.last_fetch_time
+		WHEN EXCLUDED.last_fetch_time IS NULL THEN history_coverage.last_fetch_time
+		WHEN EXCLUDED.last_fetch_time > history_coverage.last_fetch_time THEN EXCLUDED.last_fetch_time
+		ELSE history_coverage.last_fetch_time
+	END,
+	last_error = CASE WHEN EXCLUDED.status = 'covered' THEN '' ELSE EXCLUDED.last_error END,
+	updated_at = EXCLUDED.updated_at`), args...)
+		return err
+	case DialectMySQL:
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO history_coverage (
+	dataset, market, code, trade_date, period, adjust_type, status, row_count, checksum, source_address, last_fetch_time, last_error, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+	status = CASE WHEN status = 'covered' AND VALUES(status) <> 'covered' THEN status ELSE VALUES(status) END,
+	row_count = GREATEST(row_count, VALUES(row_count)),
+	checksum = CASE WHEN status = 'covered' AND VALUES(status) <> 'covered' THEN checksum WHEN LENGTH(VALUES(checksum)) = 0 THEN checksum ELSE VALUES(checksum) END,
+	source_address = CASE WHEN LENGTH(VALUES(source_address)) = 0 THEN source_address ELSE VALUES(source_address) END,
+	last_fetch_time = CASE WHEN last_fetch_time IS NULL THEN VALUES(last_fetch_time) WHEN VALUES(last_fetch_time) IS NULL THEN last_fetch_time WHEN VALUES(last_fetch_time) > last_fetch_time THEN VALUES(last_fetch_time) ELSE last_fetch_time END,
+	last_error = CASE WHEN VALUES(status) = 'covered' THEN '' ELSE VALUES(last_error) END,
+	updated_at = VALUES(updated_at)`, args...)
+		return err
+	default:
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO history_coverage (
+	dataset, market, code, trade_date, period, adjust_type, status, row_count, checksum, source_address, last_fetch_time, last_error, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (dataset, market, code, trade_date, period, adjust_type) DO UPDATE SET
+	status = CASE
+		WHEN history_coverage.status = 'covered' AND excluded.status <> 'covered' THEN history_coverage.status
+		ELSE excluded.status
+	END,
+	row_count = max(history_coverage.row_count, excluded.row_count),
+	checksum = CASE
+		WHEN history_coverage.status = 'covered' AND excluded.status <> 'covered' THEN history_coverage.checksum
+		WHEN length(excluded.checksum) = 0 THEN history_coverage.checksum
+		ELSE excluded.checksum
+	END,
+	source_address = CASE WHEN length(excluded.source_address) = 0 THEN history_coverage.source_address ELSE excluded.source_address END,
+	last_fetch_time = CASE
+		WHEN history_coverage.last_fetch_time IS NULL THEN excluded.last_fetch_time
+		WHEN excluded.last_fetch_time IS NULL THEN history_coverage.last_fetch_time
+		WHEN excluded.last_fetch_time > history_coverage.last_fetch_time THEN excluded.last_fetch_time
+		ELSE history_coverage.last_fetch_time
+	END,
+	last_error = CASE WHEN excluded.status = 'covered' THEN '' ELSE excluded.last_error END,
+	updated_at = excluded.updated_at`, args...)
+		return err
+	}
+}
+
+func (s *SQLStore) upsertTick(ctx context.Context, tx *sql.Tx, tick domain.Tick, tradeDate time.Time) error {
+	args := []any{tick.Symbol.Market, tick.Symbol.Code, tradeDate, tick.TradeTime, tick.Price, tick.Volume, tick.Amount, tick.Direction, tick.Sequence, tick.Source, "", nil, ""}
+	switch s.dialect {
+	case DialectPostgres:
+		_, err := tx.ExecContext(ctx, bind(s.dialect, `
+INSERT INTO history_ticks (
+	market, code, trade_date, trade_time, price, volume, amount, direction, sequence, source, source_address, fetch_time, checksum
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (market, code, trade_date, trade_time, sequence) DO UPDATE SET
+	price = EXCLUDED.price,
+	volume = EXCLUDED.volume,
+	amount = EXCLUDED.amount,
+	direction = EXCLUDED.direction,
+	source = EXCLUDED.source,
+	source_address = EXCLUDED.source_address,
+	fetch_time = EXCLUDED.fetch_time,
+	checksum = EXCLUDED.checksum`), args...)
+		return err
+	case DialectMySQL:
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO history_ticks (
+	market, code, trade_date, trade_time, price, volume, amount, direction, sequence, source, source_address, fetch_time, checksum
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+	price = VALUES(price), volume = VALUES(volume), amount = VALUES(amount), direction = VALUES(direction), source = VALUES(source), source_address = VALUES(source_address), fetch_time = VALUES(fetch_time), checksum = VALUES(checksum)`, args...)
+		return err
+	default:
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO history_ticks (
+	market, code, trade_date, trade_time, price, volume, amount, direction, sequence, source, source_address, fetch_time, checksum
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (market, code, trade_date, trade_time, sequence) DO UPDATE SET
+	price = excluded.price,
+	volume = excluded.volume,
+	amount = excluded.amount,
+	direction = excluded.direction,
+	source = excluded.source,
+	source_address = excluded.source_address,
+	fetch_time = excluded.fetch_time,
+	checksum = excluded.checksum`, args...)
+		return err
+	}
+}
+
+func (s *SQLStore) upsertBar(ctx context.Context, tx *sql.Tx, bar domain.Bar, adjust domain.AdjustType) error {
+	args := []any{bar.Symbol.Market, bar.Symbol.Code, bar.Period, adjust, bar.Time, bar.Open, bar.High, bar.Low, bar.Close, bar.Volume, bar.Amount, bar.Source, "", nil, ""}
+	switch s.dialect {
+	case DialectPostgres:
+		_, err := tx.ExecContext(ctx, bind(s.dialect, `
+INSERT INTO kline_bars (
+	market, code, period, adjust_type, bar_time, open, high, low, close, volume, amount, source, source_address, fetch_time, checksum
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (market, code, period, adjust_type, bar_time) DO UPDATE SET
+	open = EXCLUDED.open,
+	high = EXCLUDED.high,
+	low = EXCLUDED.low,
+	close = EXCLUDED.close,
+	volume = EXCLUDED.volume,
+	amount = EXCLUDED.amount,
+	source = EXCLUDED.source,
+	source_address = EXCLUDED.source_address,
+	fetch_time = EXCLUDED.fetch_time,
+	checksum = EXCLUDED.checksum`), args...)
+		return err
+	case DialectMySQL:
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO kline_bars (
+	market, code, period, adjust_type, bar_time, open, high, low, close, volume, amount, source, source_address, fetch_time, checksum
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+	open = VALUES(open), high = VALUES(high), low = VALUES(low), close = VALUES(close), volume = VALUES(volume), amount = VALUES(amount), source = VALUES(source), source_address = VALUES(source_address), fetch_time = VALUES(fetch_time), checksum = VALUES(checksum)`, args...)
+		return err
+	default:
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO kline_bars (
+	market, code, period, adjust_type, bar_time, open, high, low, close, volume, amount, source, source_address, fetch_time, checksum
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (market, code, period, adjust_type, bar_time) DO UPDATE SET
+	open = excluded.open,
+	high = excluded.high,
+	low = excluded.low,
+	close = excluded.close,
+	volume = excluded.volume,
+	amount = excluded.amount,
+	source = excluded.source,
+	source_address = excluded.source_address,
+	fetch_time = excluded.fetch_time,
+	checksum = excluded.checksum`, args...)
+		return err
+	}
 }
 
 func ctxErr(ctx context.Context) error {

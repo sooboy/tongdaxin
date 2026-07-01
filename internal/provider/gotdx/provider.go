@@ -271,12 +271,8 @@ func newMACLivePool(ctx context.Context, name string, hosts []string, clientsPer
 		Factory: func(ctx context.Context, host source.HostConfig, index int) (macClient, error) {
 			started := time.Now()
 			log.Printf("gotdx mac client connect start pool=%s host=%s index=%d timeout_sec=%d", name, host.Address, index, timeoutSec)
-			client := gotdx.NewMAC(
-				gotdx.WithMacTCPAddress(host.Address),
-				gotdx.WithMacTCPAddressPool(),
-				gotdx.WithTimeoutSec(timeoutSec),
-			)
-			if err := client.ConnectMAC(); err != nil {
+			client, err := newConnectedLiveMACClient(host.Address, timeoutSec)
+			if err != nil {
 				log.Printf("gotdx mac client connect failed pool=%s host=%s index=%d duration=%s err=%v", name, host.Address, index, time.Since(started), err)
 				return nil, err
 			}
@@ -285,6 +281,119 @@ func newMACLivePool(ctx context.Context, name string, hosts []string, clientsPer
 		},
 		Close: func(client macClient) error { return client.Disconnect() },
 	})
+}
+
+type liveMACClient struct {
+	mu         sync.Mutex
+	address    string
+	timeoutSec int
+	client     macClient
+	connector  liveMACClientConnector
+}
+
+type liveMACClientConnector func(address string, timeoutSec int) (macClient, error)
+
+func newConnectedLiveMACClient(address string, timeoutSec int) (*liveMACClient, error) {
+	client := &liveMACClient{address: address, timeoutSec: timeoutSec}
+	if err := client.connectLocked(); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func (c *liveMACClient) connectLocked() error {
+	connector := c.connector
+	if connector == nil {
+		connector = newGotdxMACLiveClient
+	}
+	client, err := connector(c.address, c.timeoutSec)
+	if err != nil {
+		return err
+	}
+	c.client = client
+	return nil
+}
+
+func newGotdxMACLiveClient(address string, timeoutSec int) (macClient, error) {
+	client := gotdx.NewMAC(
+		gotdx.WithMacTCPAddress(address),
+		gotdx.WithMacTCPAddressPool(),
+		gotdx.WithTimeoutSec(timeoutSec),
+	)
+	if err := client.ConnectMAC(); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func (c *liveMACClient) reconnectLocked(operation string, reason error) error {
+	if c.client != nil {
+		_ = c.client.Disconnect()
+		c.client = nil
+	}
+	started := time.Now()
+	log.Printf("gotdx mac client reconnect start host=%s operation=%s timeout_sec=%d reason=%v", c.address, operation, c.timeoutSec, reason)
+	if err := c.connectLocked(); err != nil {
+		log.Printf("gotdx mac client reconnect failed host=%s operation=%s duration=%s err=%v", c.address, operation, time.Since(started), err)
+		return err
+	}
+	log.Printf("gotdx mac client reconnect success host=%s operation=%s duration=%s", c.address, operation, time.Since(started))
+	return nil
+}
+
+func (c *liveMACClient) Disconnect() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.client == nil {
+		return nil
+	}
+	err := c.client.Disconnect()
+	c.client = nil
+	return err
+}
+
+func (c *liveMACClient) MACServerInfo() (*proto.MACServerInfoReply, error) {
+	return withLiveMACClient(c, "MACServerInfo", func(client macClient) (*proto.MACServerInfoReply, error) {
+		return client.MACServerInfo()
+	})
+}
+
+func withLiveMACClient[T any](c *liveMACClient, operation string, fn func(macClient) (T, error)) (T, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client == nil {
+		if err := c.connectLocked(); err != nil {
+			var zero T
+			return zero, fmt.Errorf("%w: gotdx mac %s connect failed: %v", domain.ErrUpstreamUnavailable, operation, err)
+		}
+	}
+	result, err := callLiveMACClient(c.client, operation, fn)
+	if err == nil {
+		return result, nil
+	}
+	if reconnectErr := c.reconnectLocked(operation, err); reconnectErr != nil {
+		var zero T
+		return zero, fmt.Errorf("%w: gotdx mac %s failed: %v; reconnect failed: %v", domain.ErrUpstreamUnavailable, operation, err, reconnectErr)
+	}
+	result, err = callLiveMACClient(c.client, operation, fn)
+	if err != nil {
+		var zero T
+		return zero, fmt.Errorf("%w: gotdx mac %s failed after reconnect: %v", domain.ErrUpstreamUnavailable, operation, err)
+	}
+	return result, nil
+}
+
+func callLiveMACClient[T any](client macClient, operation string, fn func(macClient) (T, error)) (result T, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			var zero T
+			result = zero
+			log.Printf("gotdx mac client operation panic operation=%s panic=%v stack=%s", operation, recovered, debug.Stack())
+			err = fmt.Errorf("%w: gotdx mac %s panic: %v", domain.ErrUpstreamUnavailable, operation, recovered)
+		}
+	}()
+	return fn(client)
 }
 
 func selectLimitedHosts(name string, hosts []string, maxHosts int) []string {

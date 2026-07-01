@@ -71,6 +71,8 @@ func run(args []string) (err error) {
 func buildConfig(args []string) (bootstrap.Config, error) {
 	fs := flag.NewFlagSet("marketdata", flag.ContinueOnError)
 	addr := fs.String("addr", envDefault("MARKETDATA_ADDR", ":8080"), "HTTP listen address")
+	httpRouter := fs.String("http-router", envDefault("MARKETDATA_HTTP_ROUTER", "nethttp"), "HTTP router implementation: nethttp or gin")
+	grpcAddr := fs.String("grpc-addr", envDefault("MARKETDATA_GRPC_ADDR", ""), "optional gRPC listen address; empty disables gRPC")
 	offline := fs.Bool("offline", envBool("MARKETDATA_OFFLINE"), "start without live upstream connections")
 	quoteHosts := fs.String("quote-hosts", os.Getenv("MARKETDATA_QUOTE_HOSTS"), "comma-separated quote upstream hosts")
 	tickHosts := fs.String("tick-hosts", os.Getenv("MARKETDATA_TICK_HOSTS"), "comma-separated tick upstream hosts")
@@ -87,6 +89,7 @@ func buildConfig(args []string) (bootstrap.Config, error) {
 	storageMaxOpenConns := fs.Int("storage-max-open-conns", envInt("MARKETDATA_STORAGE_MAX_OPEN_CONNS", 0), "history storage max open SQL connections")
 	storageMaxIdleConns := fs.Int("storage-max-idle-conns", envInt("MARKETDATA_STORAGE_MAX_IDLE_CONNS", 0), "history storage max idle SQL connections")
 	cacheRedisURL := fs.String("cache-redis-url", envDefault("MARKETDATA_CACHE_REDIS_URL", ""), "Redis cache URL; empty uses in-process memory cache")
+	cacheKeyPrefix := fs.String("cache-key-prefix", envDefault("MARKETDATA_CACHE_KEY_PREFIX", ""), "Redis cache key prefix; empty uses default marketdata prefix")
 	apiRateLimitRPS := fs.Int("api-rate-limit-rps", envInt("MARKETDATA_API_RATE_LIMIT_RPS", 0), "global API request limit per second; 0 disables limiting")
 	apiRateLimitBurst := fs.Int("api-rate-limit-burst", envInt("MARKETDATA_API_RATE_LIMIT_BURST", 0), "global API token bucket burst; defaults to rps when omitted")
 	logDir := fs.String("log-dir", envDefaultAllowEmpty("MARKETDATA_LOG_DIR", "logs/marketdata"), "directory for daily log files; empty disables file logging")
@@ -98,6 +101,8 @@ func buildConfig(args []string) (bootstrap.Config, error) {
 
 	return bootstrap.Config{
 		Addr:                *addr,
+		GRPCAddr:            strings.TrimSpace(*grpcAddr),
+		HTTPRouter:          strings.TrimSpace(*httpRouter),
 		DisableLive:         *offline,
 		QuoteHosts:          splitHosts(*quoteHosts),
 		TickHosts:           splitHosts(*tickHosts),
@@ -114,6 +119,7 @@ func buildConfig(args []string) (bootstrap.Config, error) {
 		StorageMaxOpenConns: *storageMaxOpenConns,
 		StorageMaxIdleConns: *storageMaxIdleConns,
 		CacheRedisURL:       strings.TrimSpace(*cacheRedisURL),
+		CacheKeyPrefix:      strings.TrimSpace(*cacheKeyPrefix),
 		RateLimitRPS:        *apiRateLimitRPS,
 		RateLimitBurst:      *apiRateLimitBurst,
 		LogDir:              strings.TrimSpace(*logDir),

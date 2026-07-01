@@ -72,6 +72,69 @@ func TestLiveClientConvertsRepeatedPanicToUpstreamUnavailable(t *testing.T) {
 	}
 }
 
+func TestLiveMACClientRetriesAfterReconnect(t *testing.T) {
+	t.Parallel()
+
+	disconnects := 0
+	client := &liveMACClient{
+		address:    "mac.test:7709",
+		timeoutSec: 1,
+		client: &fakeMACClient{
+			macServerInfo: func() (*proto.MACServerInfoReply, error) {
+				return nil, errors.New("write: broken pipe")
+			},
+			disconnect: func() error {
+				disconnects++
+				return nil
+			},
+		},
+		connector: func(address string, timeoutSec int) (macClient, error) {
+			return &fakeMACClient{
+				macServerInfo: func() (*proto.MACServerInfoReply, error) {
+					return &proto.MACServerInfoReply{Today: "2026-06-29"}, nil
+				},
+			}, nil
+		},
+	}
+
+	reply, err := client.MACServerInfo()
+	if err != nil {
+		t.Fatalf("MACServerInfo: %v", err)
+	}
+	if reply.Today != "2026-06-29" {
+		t.Fatalf("reply = %+v", reply)
+	}
+	if disconnects != 1 {
+		t.Fatalf("disconnects = %d, want 1", disconnects)
+	}
+}
+
+func TestLiveMACClientConvertsRepeatedFailureToUpstreamUnavailable(t *testing.T) {
+	t.Parallel()
+
+	client := &liveMACClient{
+		address:    "mac.test:7709",
+		timeoutSec: 1,
+		client: &fakeMACClient{
+			macServerInfo: func() (*proto.MACServerInfoReply, error) {
+				return nil, errors.New("first broken pipe")
+			},
+		},
+		connector: func(address string, timeoutSec int) (macClient, error) {
+			return &fakeMACClient{
+				macServerInfo: func() (*proto.MACServerInfoReply, error) {
+					return nil, errors.New("second broken pipe")
+				},
+			}, nil
+		},
+	}
+
+	_, err := client.MACServerInfo()
+	if !errors.Is(err, domain.ErrUpstreamUnavailable) {
+		t.Fatalf("MACServerInfo error = %v, want ErrUpstreamUnavailable", err)
+	}
+}
+
 type fakeGotdxClient struct {
 	stockKLine     func(category uint16, market uint8, code string, start uint16, count uint16, times uint16, adjust uint16) ([]proto.SecurityBar, error)
 	stockFullKLine func(category uint16, market uint8, code string, times uint16, adjust uint16, fn func(kline proto.SecurityBar) bool) ([]proto.SecurityBar, error)
@@ -152,3 +215,24 @@ func (f *fakeGotdxClient) Disconnect() error {
 }
 
 var _ Client = (*fakeGotdxClient)(nil)
+
+type fakeMACClient struct {
+	macServerInfo func() (*proto.MACServerInfoReply, error)
+	disconnect    func() error
+}
+
+func (f *fakeMACClient) MACServerInfo() (*proto.MACServerInfoReply, error) {
+	if f.macServerInfo != nil {
+		return f.macServerInfo()
+	}
+	return nil, nil
+}
+
+func (f *fakeMACClient) Disconnect() error {
+	if f.disconnect != nil {
+		return f.disconnect()
+	}
+	return nil
+}
+
+var _ macClient = (*fakeMACClient)(nil)

@@ -21,6 +21,7 @@ const (
 
 // Config controls cache lifetimes shared by the in-process and Redis backends.
 type Config struct {
+	KeyPrefix      string
 	QuoteTTL       time.Duration
 	OrderBookTTL   time.Duration
 	TickTTL        time.Duration
@@ -34,6 +35,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
+		KeyPrefix:      "",
 		QuoteTTL:       defaultQuoteTTL,
 		OrderBookTTL:   defaultOrderBookTTL,
 		TickTTL:        defaultTickTTL,

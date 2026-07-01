@@ -16,6 +16,8 @@ const defaultRedisKeyPrefix = "marketdata:cache:v1"
 type redisClient interface {
 	Get(ctx context.Context, key string) *redis.StringCmd
 	Set(ctx context.Context, key string, value any, expiration time.Duration) *redis.StatusCmd
+	SetNX(ctx context.Context, key string, value any, expiration time.Duration) *redis.BoolCmd
+	Del(ctx context.Context, keys ...string) *redis.IntCmd
 	Close() error
 }
 
@@ -49,7 +51,11 @@ func OpenRedis(ctx context.Context, rawURL string, cfg Config) (*Redis, error) {
 // NewRedis wraps an existing Redis client.
 func NewRedis(client redisClient, cfg Config) *Redis {
 	cfg = normalizeConfig(cfg)
-	return &Redis{client: client, cfg: cfg, prefix: defaultRedisKeyPrefix}
+	prefix := cfg.KeyPrefix
+	if prefix == "" {
+		prefix = defaultRedisKeyPrefix
+	}
+	return &Redis{client: client, cfg: cfg, prefix: prefix}
 }
 
 // Close releases the underlying Redis client.
@@ -298,6 +304,28 @@ func putJSON[T any](ctx context.Context, client redisClient, key string, value T
 		return err
 	}
 	return client.Set(ctx, key, payload, ttl).Err()
+}
+
+func (r *Redis) TryLock(ctx context.Context, key string, ttl time.Duration) (string, bool, error) {
+	if err := ctxErr(ctx); err != nil {
+		return "", false, err
+	}
+	if ttl <= 0 {
+		ttl = 5 * time.Second
+	}
+	token := time.Now().UTC().Format(time.RFC3339Nano)
+	ok, err := r.client.SetNX(ctx, r.key("locks", key), token, ttl).Result()
+	if err != nil {
+		return "", false, err
+	}
+	return token, ok, nil
+}
+
+func (r *Redis) Unlock(ctx context.Context, key string, _ string) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	return r.client.Del(ctx, r.key("locks", key)).Err()
 }
 
 func (r *Redis) key(kind, key string) string {
